@@ -1,0 +1,1058 @@
+#!/bin/bash
+#############################################
+# 环境检查脚本
+#############################################
+
+echo "============================================"
+echo "Environment Check for CUT&Tag Analysis"
+echo "============================================"
+echo ""
+
+# 检查conda环境
+echo "1. Conda Environment:"
+if command -v conda &> /dev/null; then
+    echo "   ✓ Conda installed: $(conda --version)"
+    echo "   Current env: $CONDA_DEFAULT_ENV"
+else
+    echo "   ✗ Conda not found"
+fi
+echo ""
+
+# 检查必需软件
+echo "2. Required Software:"
+declare -A software_cmds=(
+    ["FastQC"]="fastqc --version"
+    ["MultiQC"]="multiqc --version"
+    ["Trim Galore"]="trim_galore --version"
+    ["Bowtie2"]="bowtie2 --version"
+    ["Samtools"]="samtools --version"
+    ["Picard"]="picard MarkDuplicates --version"
+    ["MACS2"]="macs2 --version"
+    ["deepTools"]="deeptools --version"
+)
+
+for software in "${!software_cmds[@]}"; do
+    cmd="${software_cmds[$software]}"
+    if eval $cmd &> /dev/null; then
+        version=$(eval $cmd 2>&1 | head -n1)
+        echo "   ✓ $software: $version"
+    else
+        echo "   ✗ $software: NOT FOUND"
+    fi
+done
+echo ""
+
+# 检查数据目录
+echo "3. Data Directories:"
+RAW_DATA="/disk192/users_dir/buyu/1.布宇/supplement/28/rawdata"
+REF_DIR="/disk192/users_dir/buyu/2.参考基因组/4.chick"
+
+if [ -d "$RAW_DATA" ]; then
+    file_count=$(ls $RAW_DATA/*.fq.gz 2>/dev/null | wc -l)
+    echo "   ✓ Raw data: $RAW_DATA ($file_count files)"
+else
+    echo "   ✗ Raw data directory not found"
+fi
+
+if [ -d "$REF_DIR" ]; then
+    echo "   ✓ Reference: $REF_DIR"
+else
+    echo "   ✗ Reference directory not found"
+fi
+echo ""
+
+# 检查系统资源
+echo "4. System Resources:"
+echo "   CPU cores: $(nproc)"
+echo "   Total memory: $(free -h | awk '/^Mem:/{print $2}')"
+echo "   Available memory: $(free -h | awk '/^Mem:/{print $7}')"
+echo "   Disk space: $(df -h /disk192 | awk 'NR==2{print $4 " available"}')"
+echo ""
+
+# 安装建议
+echo "============================================"
+echo "If any software is missing, install with:"
+echo "============================================"
+echo "conda create -n cuttag python=3.8"
+echo "conda activate cuttag"
+echo "conda install -c bioconda fastqc multiqc trim-galore bowtie2 samtools picard macs2 deeptools bedtools"
+echo ""
+
+
+
+#!/bin/bash
+#############################################
+# CUT&Tag数据分析流程
+# 第一步：项目初始化和质量控制
+# Author: plmmmz
+# Date: 2025-11-06
+# Server: 64 cores
+# Data type: CUT&Tag (Histone Acetylation)
+#############################################
+
+set -e  # 遇到错误立即停止
+set -u  # 使用未定义变量时报错
+set -o pipefail  # 管道命令出错时报错
+
+# ========== 颜色输出 ==========
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# ========== 参数设置 ==========
+WORK_DIR="/disk192/users_dir/buyu/1.布宇/supplement/28"
+RAW_DATA="${WORK_DIR}/rawdata"
+ANALYSIS_DIR="${WORK_DIR}/analysis_cuttag"
+REF_DIR="/disk192/users_dir/buyu/2.参考基因组/4.chick"
+
+# 线程数（64核心，FastQC用24线程，留些资源给系统）
+THREADS=24
+
+# 样本信息
+SAMPLES=("NB1" "NB2" "NB3" "BR30-1" "BR30-2" "BR30-3")
+
+# ========== 函数定义 ==========
+log_info() {
+    echo -e "${GREEN}[INFO]${NC} $(date '+%Y-%m-%d %H:%M:%S') - $1"
+}
+
+log_warn() {
+    echo -e "${YELLOW}[WARN]${NC} $(date '+%Y-%m-%d %H:%M:%S') - $1"
+}
+
+log_error() {
+    echo -e "${RED}[ERROR]${NC} $(date '+%Y-%m-%d %H:%M:%S') - $1"
+}
+
+log_step() {
+    echo ""
+    echo -e "${BLUE}========================================${NC}"
+    echo -e "${BLUE}$1${NC}"
+    echo -e "${BLUE}========================================${NC}"
+}
+
+# ========== 检查软件依赖 ==========
+check_software() {
+    log_step "Checking Software Dependencies"
+    
+    local software_list=("fastqc" "multiqc")
+    local missing_software=()
+    
+    for software in "${software_list[@]}"; do
+        if command -v $software &> /dev/null; then
+            version=$($software --version 2>&1 | head -n1)
+            log_info "✓ $software is installed: $version"
+        else
+            log_warn "✗ $software is NOT installed"
+            missing_software+=($software)
+        fi
+    done
+    
+    if [ ${#missing_software[@]} -gt 0 ]; then
+        log_error "Missing software: ${missing_software[*]}"
+        log_info "Install with: conda install -c bioconda ${missing_software[*]}"
+        exit 1
+    fi
+    
+    log_info "All required software is installed!"
+}
+
+# ========== 创建目录结构 ==========
+create_directories() {
+    log_step "Creating Directory Structure"
+    
+    mkdir -p ${ANALYSIS_DIR}/{01_fastqc/{raw,trimmed},02_trim,03_align/{bam,qc,flagstat},04_peaks/{macs2,seacr},05_diff,06_visualization,scripts,logs,reference}
+    
+    log_info "Directory structure created:"
+    tree -L 2 ${ANALYSIS_DIR} 2>/dev/null || ls -lR ${ANALYSIS_DIR}
+}
+
+# ========== 创建项目文档 ==========
+create_project_info() {
+    log_step "Creating Project Documentation"
+    
+    cat > ${ANALYSIS_DIR}/project_info.txt <<EOF
+╔════════════════════════════════════════════════════════════╗
+║           CUT&Tag Analysis Pipeline                        ║
+║           Histone Acetylation Profiling                    ║
+╚════════════════════════════════════════════════════════════╝
+
+Project Information:
+--------------------
+Date Created: 2025-11-06 14:26:11 UTC
+Analyst: plmmmz
+Server: 64 CPU cores
+Data Type: CUT&Tag (Cleavage Under Targets & Tagmentation)
+
+Sample Information:
+-------------------
+Control Group (NB):  NB1, NB2, NB3
+Treatment Group (BR30): BR30-1, BR30-2, BR30-3
+Total Samples: 6 (3 biological replicates per group)
+Sequencing: Paired-end (PE)
+
+Reference Genome:
+-----------------
+Species: Gallus gallus (Chicken)
+Assembly: GRCg7b (bGalGal1.mat.broiler)
+Version: Ensembl 115
+GTF: ${REF_DIR}/Gallus_gallus.bGalGal1.mat.broiler.GRCg7b.115.gtf.gz
+FASTA: ${REF_DIR}/Gallus_gallus.bGalGal1.mat.broiler.GRCg7b.dna.toplevel.fa.gz
+
+Analysis Pipeline:
+------------------
+Step 1: Quality Control (FastQC + MultiQC)
+Step 2: Adapter Trimming (Trim Galore)
+Step 3: Reference Genome Indexing (Bowtie2)
+Step 4: Alignment (Bowtie2)
+Step 5: Post-alignment QC & Filtering
+        - Remove duplicates (Picard)
+        - Remove mitochondrial reads (critical for CUT&Tag!)
+        - Filter by MAPQ ≥ 20
+Step 6: Peak Calling (MACS2 & SEACR)
+Step 7: Differential Binding Analysis (DiffBind)
+Step 8: Visualization (deepTools, IGV)
+
+Directory Structure:
+--------------------
+01_fastqc/       - Quality control reports
+02_trim/         - Trimmed fastq files
+03_align/        - Alignment files (BAM)
+04_peaks/        - Peak calling results
+05_diff/         - Differential analysis
+06_visualization/- Plots and figures
+scripts/         - Analysis scripts
+logs/            - Log files
+reference/       - Genome index files
+
+Key Features for CUT&Tag:
+--------------------------
+• Low background noise
+• High signal-to-noise ratio
+• Mitochondrial DNA removal (important!)
+• Sharp, narrow peaks
+• Lower sequencing depth required than ChIP-seq
+• Fragment size distribution analysis
+
+Notes:
+------
+CUT&Tag typically shows:
+- Fragment size ~150bp (mononucleosome)
+- Very low background
+- High enrichment at target sites
+EOF
+
+    log_info "Project documentation created: ${ANALYSIS_DIR}/project_info.txt"
+}
+
+# ========== 检查原始数据 ==========
+check_raw_data() {
+    log_step "Checking Raw Data Files"
+    
+    log_info "Raw data directory: ${RAW_DATA}"
+    
+    if [ ! -d "${RAW_DATA}" ]; then
+        log_error "Raw data directory not found!"
+        exit 1
+    fi
+    
+    # 统计文件信息
+    local file_count=$(ls ${RAW_DATA}/*.fq.gz 2>/dev/null | wc -l)
+    log_info "Found ${file_count} fastq.gz files"
+    
+    echo ""
+    log_info "File details:"
+    for sample in "${SAMPLES[@]}"; do
+        r1="${RAW_DATA}/${sample}_R1.fq.gz"
+        r2="${RAW_DATA}/${sample}_R2.fq.gz"
+        
+        if [ -f "$r1" ] && [ -f "$r2" ]; then
+            size_r1=$(du -h "$r1" | cut -f1)
+            size_r2=$(du -h "$r2" | cut -f1)
+            log_info "  ✓ ${sample}: R1=${size_r1}, R2=${size_r2}"
+        else
+            log_error "  ✗ ${sample}: Files missing!"
+        fi
+    done
+}
+
+# ========== 运行FastQC ==========
+run_fastqc() {
+    log_step "Step 1: Running FastQC - Quality Control"
+    
+    log_info "FastQC parameters:"
+    log_info "  - Threads: ${THREADS}"
+    log_info "  - Input: ${RAW_DATA}/*.fq.gz"
+    log_info "  - Output: ${ANALYSIS_DIR}/01_fastqc/raw"
+    
+    # 运行FastQC
+    fastqc \
+        ${RAW_DATA}/*.fq.gz \
+        -o ${ANALYSIS_DIR}/01_fastqc/raw \
+        -t ${THREADS} \
+        --nogroup \
+        2>&1 | tee ${ANALYSIS_DIR}/logs/step1_fastqc.log
+    
+    if [ ${PIPESTATUS[0]} -eq 0 ]; then
+        log_info "FastQC completed successfully!"
+    else
+        log_error "FastQC failed! Check log file."
+        exit 1
+    fi
+}
+
+# ========== 运行MultiQC ==========
+run_multiqc() {
+    log_step "Running MultiQC - Aggregating QC Reports"
+    
+    if command -v multiqc &> /dev/null; then
+        multiqc \
+            ${ANALYSIS_DIR}/01_fastqc/raw \
+            -o ${ANALYSIS_DIR}/01_fastqc/raw \
+            -n raw_data_multiqc_report \
+            --force \
+            2>&1 | tee -a ${ANALYSIS_DIR}/logs/step1_multiqc.log
+        
+        log_info "MultiQC report: ${ANALYSIS_DIR}/01_fastqc/raw/raw_data_multiqc_report.html"
+    else
+        log_warn "MultiQC not installed, skipping aggregate report"
+    fi
+}
+
+# ========== 生成样本统计 ==========
+generate_stats() {
+    log_step "Generating Sample Statistics"
+    
+    cat > ${ANALYSIS_DIR}/01_fastqc/sample_stats.txt <<EOF
+Sample Statistics Summary
+Generated: $(date '+%Y-%m-%d %H:%M:%S')
+================================================
+
+Sample      R1 Size    R2 Size    Status
+------      -------    -------    ------
+EOF
+
+    for sample in "${SAMPLES[@]}"; do
+        r1="${RAW_DATA}/${sample}_R1.fq.gz"
+        r2="${RAW_DATA}/${sample}_R2.fq.gz"
+        size_r1=$(du -h "$r1" | cut -f1)
+        size_r2=$(du -h "$r2" | cut -f1)
+        printf "%-10s  %-9s  %-9s  ✓\n" "$sample" "$size_r1" "$size_r2" >> ${ANALYSIS_DIR}/01_fastqc/sample_stats.txt
+    done
+    
+    log_info "Statistics saved: ${ANALYSIS_DIR}/01_fastqc/sample_stats.txt"
+}
+
+# ========== 创建下一步脚本预览 ==========
+create_next_step_preview() {
+    log_step "Preparing Next Step"
+    
+    cat > ${ANALYSIS_DIR}/scripts/NEXT_STEPS.txt <<EOF
+╔════════════════════════════════════════════════════════════╗
+║                   NEXT STEPS                               ║
+╚════════════════════════════════════════════════════════════╝
+
+Current Status: ✓ Step 1 Completed - Quality Control
+
+What to do now:
+---------------
+1. Check the FastQC reports:
+   - Open: ${ANALYSIS_DIR}/01_fastqc/raw/raw_data_multiqc_report.html
+   
+2. Look for these quality metrics:
+   ✓ Per base sequence quality (should be >30)
+   ✓ Per sequence quality scores (peak at high quality)
+   ✓ Adapter content (should be detected if present)
+   ✓ Sequence duplication levels (CUT&Tag may show high duplication - this is normal!)
+   ✓ Fragment size distribution
+
+3. Expected CUT&Tag characteristics:
+   • Fragment sizes around 150bp (mononucleosome)
+   • May see high duplication (OK for CUT&Tag due to low background)
+   • Should have good quality scores (Q30+)
+   • Adapter contamination is common - we'll trim in Step 2
+
+Next Command:
+-------------
+After reviewing the QC reports, run Step 2 (Trimming):
+
+    bash ${ANALYSIS_DIR}/scripts/step2_trimming.sh
+
+Questions to consider:
+----------------------
+1. What is the specific histone mark? (H3K27ac, H3K4me3, etc.)
+2. Do you have IgG control samples?
+3. What are the expected peak characteristics?
+   - Broad peaks (H3K27ac, H3K9ac)
+   - Narrow peaks (H3K4me3)
+
+EOF
+
+    log_info "Next steps guide: ${ANALYSIS_DIR}/scripts/NEXT_STEPS.txt"
+}
+
+# ========== 主流程 ==========
+main() {
+    log_step "CUT&Tag Analysis Pipeline - Step 1"
+    log_info "Start time: $(date '+%Y-%m-%d %H:%M:%S')"
+    
+    # 执行各步骤
+    check_software
+    create_directories
+    create_project_info
+    check_raw_data
+    run_fastqc
+    run_multiqc
+    generate_stats
+    create_next_step_preview
+    
+    # 完成信息
+    log_step "Step 1 Completed Successfully!"
+    log_info "End time: $(date '+%Y-%m-%d %H:%M:%S')"
+    
+    echo ""
+    echo -e "${GREEN}╔════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${GREEN}║            STEP 1 COMPLETED SUCCESSFULLY! ✓                ║${NC}"
+    echo -e "${GREEN}╚════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    echo -e "${YELLOW}Next Actions:${NC}"
+    echo "1. Review QC report: firefox ${ANALYSIS_DIR}/01_fastqc/raw/raw_data_multiqc_report.html"
+    echo "2. Check next steps: cat ${ANALYSIS_DIR}/scripts/NEXT_STEPS.txt"
+    echo "3. Review project info: cat ${ANALYSIS_DIR}/project_info.txt"
+    echo ""
+    echo -e "${YELLOW}Key Files:${NC}"
+    echo "  📊 MultiQC Report: 01_fastqc/raw/raw_data_multiqc_report.html"
+    echo "  📝 Project Info: project_info.txt"
+    echo "  📋 Sample Stats: 01_fastqc/sample_stats.txt"
+    echo "  📜 Log File: logs/step1_fastqc.log"
+    echo ""
+}
+
+# ========== 执行主流程 ==========
+main "$@"
+#!/bin/bash
+#############################################
+# CUT&Tag数据分析流程
+# 第二步：接头去除和质量过滤
+# Author: plmmmz
+# Date: 2025-11-06
+# Server: 64 cores
+# Tool: Trim Galore (包装了Cutadapt和FastQC)
+#############################################
+
+set -e
+set -u
+set -o pipefail
+
+# ========== 颜色输出 ==========
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+# ========== 参数设置 ==========
+WORK_DIR="/disk192/users_dir/buyu/1.布宇/supplement/28"
+RAW_DATA="${WORK_DIR}/rawdata"
+ANALYSIS_DIR="${WORK_DIR}/analysis_cuttag"
+TRIM_DIR="${ANALYSIS_DIR}/02_trim"
+FASTQC_DIR="${ANALYSIS_DIR}/01_fastqc/trimmed"
+
+# 线程数（每个样本用8线程，可以同时处理多个样本）
+THREADS_PER_SAMPLE=8
+PARALLEL_SAMPLES=4  # 同时处理4个样本，8*4=32核心
+
+# Trim Galore参数
+QUALITY=20           # Phred质量阈值
+MIN_LENGTH=20        # 最小读长
+STRINGENCY=5         # 接头匹配严格度
+
+# 样本信息
+SAMPLES=("NB1" "NB2" "NB3" "BR30-1" "BR30-2" "BR30-3")
+
+# ========== 函数定义 ==========
+log_info() {
+    echo -e "${GREEN}[INFO]${NC} $(date '+%Y-%m-%d %H:%M:%S') - $1"
+}
+
+log_warn() {
+    echo -e "${YELLOW}[WARN]${NC} $(date '+%Y-%m-%d %H:%M:%S') - $1"
+}
+
+log_error() {
+    echo -e "${RED}[ERROR]${NC} $(date '+%Y-%m-%d %H:%M:%S') - $1"
+}
+
+log_step() {
+    echo ""
+    echo -e "${BLUE}========================================${NC}"
+    echo -e "${BLUE}$1${NC}"
+    echo -e "${BLUE}========================================${NC}"
+}
+
+# ========== 检查软件依赖 ==========
+check_software() {
+    log_step "Checking Software Dependencies"
+    
+    local required_software=("trim_galore" "cutadapt" "fastqc")
+    local missing_software=()
+    
+    for software in "${required_software[@]}"; do
+        if command -v $software &> /dev/null; then
+            version=$($software --version 2>&1 | head -n1)
+            log_info "✓ $software: $version"
+        else
+            log_warn "✗ $software: NOT installed"
+            missing_software+=($software)
+        fi
+    done
+    
+    if [ ${#missing_software[@]} -gt 0 ]; then
+        log_error "Missing software: ${missing_software[*]}"
+        log_info "Install with: conda install -c bioconda trim-galore cutadapt fastqc"
+        exit 1
+    fi
+    
+    log_info "All required software is installed!"
+}
+
+# ========== 创建目录 ==========
+create_directories() {
+    log_step "Creating Output Directories"
+    
+    mkdir -p ${TRIM_DIR}
+    mkdir -p ${FASTQC_DIR}
+    mkdir -p ${ANALYSIS_DIR}/logs/trim
+    
+    log_info "Output directories created"
+}
+
+# ========== 运行Trim Galore (单个样本) ==========
+trim_sample() {
+    local sample=$1
+    local r1="${RAW_DATA}/${sample}_R1.fq.gz"
+    local r2="${RAW_DATA}/${sample}_R2.fq.gz"
+    
+    log_info "Processing ${sample}..."
+    
+    # Trim Galore for paired-end data
+    trim_galore \
+        --paired \
+        --quality ${QUALITY} \
+        --phred33 \
+        --stringency ${STRINGENCY} \
+        --length ${MIN_LENGTH} \
+        --cores ${THREADS_PER_SAMPLE} \
+        --fastqc \
+        --gzip \
+        --output_dir ${TRIM_DIR} \
+        ${r1} ${r2} \
+        2>&1 | tee ${ANALYSIS_DIR}/logs/trim/${sample}_trim.log
+    
+    if [ ${PIPESTATUS[0]} -eq 0 ]; then
+        log_info "✓ ${sample} trimming completed successfully!"
+        return 0
+    else
+        log_error "✗ ${sample} trimming failed!"
+        return 1
+    fi
+}
+
+# ========== 批量处理样本 ==========
+process_all_samples() {
+    log_step "Step 2: Running Trim Galore - Quality Filtering & Adapter Trimming"
+    
+    log_info "Trim Galore parameters:"
+    log_info "  - Quality threshold: Q${QUALITY}"
+    log_info "  - Minimum length: ${MIN_LENGTH}bp"
+    log_info "  - Adapter stringency: ${STRINGENCY}"
+    log_info "  - Threads per sample: ${THREADS_PER_SAMPLE}"
+    log_info "  - Parallel samples: ${PARALLEL_SAMPLES}"
+    
+    # 记录开始时间
+    local start_time=$(date +%s)
+    
+    # 创建临时文件存储样本列表
+    local sample_list="${ANALYSIS_DIR}/logs/sample_list.txt"
+    printf "%s\n" "${SAMPLES[@]}" > ${sample_list}
+    
+    # 使用GNU parallel或循环处理
+    if command -v parallel &> /dev/null; then
+        log_info "Using GNU parallel for faster processing..."
+        export -f trim_sample log_info log_error
+        export RAW_DATA TRIM_DIR ANALYSIS_DIR QUALITY STRINGENCY MIN_LENGTH THREADS_PER_SAMPLE GREEN RED NC
+        
+        cat ${sample_list} | parallel -j ${PARALLEL_SAMPLES} trim_sample {}
+    else
+        log_warn "GNU parallel not found, processing sequentially..."
+        for sample in "${SAMPLES[@]}"; do
+            trim_sample ${sample}
+        done
+    fi
+    
+    # 记录结束时间
+    local end_time=$(date +%s)
+    local elapsed=$((end_time - start_time))
+    log_info "Total trimming time: ${elapsed} seconds ($(($elapsed/60)) minutes)"
+}
+
+# ========== 移动FastQC报告 ==========
+organize_fastqc_reports() {
+    log_step "Organizing FastQC Reports"
+    
+    # 移动trim后的FastQC报告
+    if ls ${TRIM_DIR}/*_fastqc.html 1> /dev/null 2>&1; then
+        mv ${TRIM_DIR}/*_fastqc.* ${FASTQC_DIR}/ 2>/dev/null || true
+        log_info "FastQC reports moved to ${FASTQC_DIR}"
+    else
+        log_warn "No FastQC reports found"
+    fi
+}
+
+# ========== 运行MultiQC ==========
+run_multiqc() {
+    log_step "Running MultiQC on Trimmed Data"
+    
+    if command -v multiqc &> /dev/null; then
+        multiqc \
+            ${FASTQC_DIR} \
+            ${ANALYSIS_DIR}/logs/trim \
+            -o ${FASTQC_DIR} \
+            -n trimmed_data_multiqc_report \
+            --force \
+            2>&1 | tee ${ANALYSIS_DIR}/logs/step2_multiqc.log
+        
+        log_info "MultiQC report: ${FASTQC_DIR}/trimmed_data_multiqc_report.html"
+    else
+        log_warn "MultiQC not installed, skipping aggregate report"
+    fi
+}
+
+# ========== 生成统计报告 ==========
+generate_trim_stats() {
+    log_step "Generating Trimming Statistics"
+    
+    local stats_file="${TRIM_DIR}/trimming_stats.txt"
+    
+    cat > ${stats_file} <<EOF
+╔════════════════════════════════════════════════════════════╗
+║           Trimming Statistics Summary                      ║
+╚════════════════════════════════════════════════════════════╝
+
+Generated: $(date '+%Y-%m-%d %H:%M:%S')
+
+Parameters Used:
+----------------
+Quality threshold: Q${QUALITY}
+Minimum length: ${MIN_LENGTH} bp
+Adapter stringency: ${STRINGENCY}
+Threads per sample: ${THREADS_PER_SAMPLE}
+
+Sample Summary:
+---------------
+EOF
+
+    # 统计每个样本的信息
+    for sample in "${SAMPLES[@]}"; do
+        echo "" >> ${stats_file}
+        echo "Sample: ${sample}" >> ${stats_file}
+        echo "----------------------------------------" >> ${stats_file}
+        
+        # 原始文件大小
+        r1_raw="${RAW_DATA}/${sample}_R1.fq.gz"
+        r2_raw="${RAW_DATA}/${sample}_R2.fq.gz"
+        
+        if [ -f "$r1_raw" ]; then
+            r1_size=$(du -h "$r1_raw" | cut -f1)
+            echo "  Raw R1: $r1_size" >> ${stats_file}
+        fi
+        
+        if [ -f "$r2_raw" ]; then
+            r2_size=$(du -h "$r2_raw" | cut -f1)
+            echo "  Raw R2: $r2_size" >> ${stats_file}
+        fi
+        
+        # Trim后的文件
+        r1_trim="${TRIM_DIR}/${sample}_R1_val_1.fq.gz"
+        r2_trim="${TRIM_DIR}/${sample}_R2_val_2.fq.gz"
+        
+        if [ -f "$r1_trim" ]; then
+            r1_trim_size=$(du -h "$r1_trim" | cut -f1)
+            echo "  Trimmed R1: $r1_trim_size" >> ${stats_file}
+        fi
+        
+        if [ -f "$r2_trim" ]; then
+            r2_trim_size=$(du -h "$r2_trim" | cut -f1)
+            echo "  Trimmed R2: $r2_trim_size" >> ${stats_file}
+        fi
+        
+        # 从log文件提取统计信息
+        log_file="${ANALYSIS_DIR}/logs/trim/${sample}_trim.log"
+        if [ -f "$log_file" ]; then
+            # 提取reads保留率
+            if grep -q "Reads written" "$log_file"; then
+                echo "  Log info:" >> ${stats_file}
+                grep -A 3 "Reads written" "$log_file" | sed 's/^/    /' >> ${stats_file}
+            fi
+        fi
+    done
+    
+    # 总体统计
+    echo "" >> ${stats_file}
+    echo "╔════════════════════════════════════════════════════════════╗" >> ${stats_file}
+    echo "║           Output Files Summary                             ║" >> ${stats_file}
+    echo "╚════════════════════════════════════════════════════════════╝" >> ${stats_file}
+    echo "" >> ${stats_file}
+    echo "Trimmed fastq files:" >> ${stats_file}
+    ls -lh ${TRIM_DIR}/*.fq.gz 2>/dev/null | awk '{print "  " $9 " (" $5 ")"}' >> ${stats_file} || echo "  No files found" >> ${stats_file}
+    
+    log_info "Statistics saved: ${stats_file}"
+}
+
+# ========== 验证输出文件 ==========
+validate_output() {
+    log_step "Validating Output Files"
+    
+    local all_ok=true
+    
+    for sample in "${SAMPLES[@]}"; do
+        r1_trim="${TRIM_DIR}/${sample}_R1_val_1.fq.gz"
+        r2_trim="${TRIM_DIR}/${sample}_R2_val_2.fq.gz"
+        
+        if [ -f "$r1_trim" ] && [ -f "$r2_trim" ]; then
+            log_info "✓ ${sample}: Output files present"
+        else
+            log_error "✗ ${sample}: Output files missing!"
+            all_ok=false
+        fi
+    done
+    
+    if [ "$all_ok" = true ]; then
+        log_info "All output files validated successfully!"
+        return 0
+    else
+        log_error "Some output files are missing!"
+        return 1
+    fi
+}
+
+# ========== 创建下一步指南 ==========
+create_next_step_guide() {
+    log_step "Creating Next Step Guide"
+    
+    cat > ${ANALYSIS_DIR}/scripts/NEXT_STEPS_step3.txt <<EOF
+╔════════════════════════════════════════════════════════════╗
+║                   NEXT STEPS - Step 3                      ║
+╚════════════════════════════════════════════════════════════╝
+
+Current Status: ✓ Step 2 Completed - Quality Filtering & Adapter Trimming
+
+What was done:
+--------------
+✓ Adapter trimming (Illumina adapters auto-detected)
+✓ Quality filtering (Q${QUALITY})
+✓ Length filtering (minimum ${MIN_LENGTH}bp)
+✓ Post-trim FastQC analysis
+✓ MultiQC report generation
+
+Review Results:
+---------------
+1. Check trimming statistics:
+   cat ${TRIM_DIR}/trimming_stats.txt
+
+2. Compare pre/post trim quality:
+   Before: ${ANALYSIS_DIR}/01_fastqc/raw/raw_data_multiqc_report.html
+   After:  ${FASTQC_DIR}/trimmed_data_multiqc_report.html
+
+3. Check individual trim logs:
+   ls ${ANALYSIS_DIR}/logs/trim/
+
+Expected Results:
+-----------------
+• Adapter content should be reduced/removed
+• Quality scores should improve
+• Some reads may be discarded (typically 5-15% for good quality data)
+• Read length distribution may shift slightly
+
+Next Command:
+-------------
+Proceed to Step 3 (Build Genome Index & Alignment):
+
+    bash ${ANALYSIS_DIR}/scripts/step3_align.sh
+
+Step 3 will:
+-----------
+1. Build Bowtie2 index for chicken genome (GRCg7b)
+2. Align trimmed reads to reference genome
+3. Remove duplicates with Picard
+4. Remove mitochondrial reads (important for CUT&Tag!)
+5. Filter by mapping quality (MAPQ ≥ 20)
+6. Generate alignment statistics
+
+Estimated time: 2-3 hours for all samples
+
+EOF
+
+    log_info "Next step guide created: ${ANALYSIS_DIR}/scripts/NEXT_STEPS_step3.txt"
+}
+
+# ========== 主流程 ==========
+main() {
+    log_step "CUT&Tag Analysis Pipeline - Step 2"
+    log_info "Start time: $(date '+%Y-%m-%d %H:%M:%S')"
+    
+    # 执行各步骤
+    check_software
+    create_directories
+    process_all_samples
+    organize_fastqc_reports
+    run_multiqc
+    generate_trim_stats
+    validate_output
+    create_next_step_guide
+    
+    # 完成信息
+    log_step "Step 2 Completed Successfully!"
+    log_info "End time: $(date '+%Y-%m-%d %H:%M:%S')"
+    
+    echo ""
+    echo -e "${GREEN}╔════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${GREEN}║          STEP 2 COMPLETED SUCCESSFULLY! ✓                  ║${NC}"
+    echo -e "${GREEN}╚════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    echo -e "${YELLOW}Key Output Files:${NC}"
+    echo "  📁 Trimmed reads: ${TRIM_DIR}/"
+    echo "  📊 MultiQC report: ${FASTQC_DIR}/trimmed_data_multiqc_report.html"
+    echo "  📈 Statistics: ${TRIM_DIR}/trimming_stats.txt"
+    echo "  📜 Logs: ${ANALYSIS_DIR}/logs/trim/"
+    echo ""
+    echo -e "${YELLOW}Next Actions:${NC}"
+    echo "1. Review trimming stats: cat ${TRIM_DIR}/trimming_stats.txt"
+    echo "2. Compare QC reports (before/after trimming)"
+    echo "3. Run Step 3: bash ${ANALYSIS_DIR}/scripts/step3_align.sh"
+    echo ""
+    echo -e "${BLUE}Trimmed files are ready for alignment!${NC}"
+    echo ""
+}
+
+# ========== 执行主流程 ==========
+main "$@"
+
+
+
+
+# 1. 检查进程是否还在运行
+ps aux | grep -E "(bowtie2|picard|samtools)" | grep -v grep
+
+# 2. 检查已生成的文件
+ls -lh /disk192/users_dir/buyu/1.布宇/supplement/28/analysis_cuttag/03_align/bam/
+
+# 3. 查看最后的日志
+tail -50 /disk192/users_dir/buyu/1.布宇/supplement/28/analysis_cuttag/logs/align/NB1_align.log
+
+
+cd /disk192/users_dir/buyu/1.布宇/supplement/28/analysis_cuttag
+rm -f 03_align/bam/NB1.*
+
+TRIM_DIR="02_trim"
+ALIGN_DIR="03_align"
+INDEX="reference/GRCg7b"
+
+for sample in NB1 NB2 NB3 BR30-1 BR30-2 BR30-3; do
+  echo "=== Processing $sample at $(date) ==="
+  
+  [ -f "$ALIGN_DIR/bam/$sample.final.bam" ] && echo "$sample done, skip" && continue
+  
+  bowtie2 -p 64 --very-sensitive --phred33 -I 10 -X 700 \
+    --rg-id $sample --rg "SM:$sample" --rg "PL:ILLUMINA" \
+    -x $INDEX -1 $TRIM_DIR/${sample}_R1_val_1.fq.gz -2 $TRIM_DIR/${sample}_R2_val_2.fq.gz \
+    2> logs/align/${sample}.log | samtools view -@ 32 -bS - | samtools sort -@ 32 -o $ALIGN_DIR/bam/$sample.sorted.bam
+  
+  samtools index -@ 16 $ALIGN_DIR/bam/$sample.sorted.bam
+  
+  picard -Xmx40g MarkDuplicates I=$ALIGN_DIR/bam/$sample.sorted.bam O=$ALIGN_DIR/bam/$sample.dedup.bam \
+    M=$ALIGN_DIR/qc/$sample.dup.txt REMOVE_DUPLICATES=true ASSUME_SORTED=true VALIDATION_STRINGENCY=LENIENT
+  
+  samtools view -@ 32 -b -q 20 $ALIGN_DIR/bam/$sample.dedup.bam -o $ALIGN_DIR/bam/$sample.final.bam
+  samtools index -@ 16 $ALIGN_DIR/bam/$sample.final.bam
+  
+  rm -f $ALIGN_DIR/bam/$sample.sorted.bam* $ALIGN_DIR/bam/$sample.dedup.bam*
+  
+  echo "$sample done at $(date)"
+done
+
+
+cd /disk192/users_dir/buyu/1.布宇/supplement/28/analysis_cuttag
+
+mkdir -p 04_peaks/{macs2,bigwig,qc}
+mkdir -p logs/peaks
+
+# ========== MACS2 Broad Peak Calling ==========
+for sample in NB1 NB2 NB3 BR30-1 BR30-2 BR30-3; do
+  echo "=== Calling peaks for $sample at $(date) ==="
+  
+  macs2 callpeak \
+    -t 03_align/bam/${sample}.final.bam \
+    -f BAMPE \
+    -g 1.05e9 \
+    -n ${sample} \
+    --outdir 04_peaks/macs2 \
+    --broad \
+    --broad-cutoff 0.05 \
+    -q 0.05 \
+    --keep-dup all \
+    2>&1 | tee logs/peaks/${sample}_macs2.log
+  
+  echo "$sample peaks called at $(date)"
+done
+
+# ========== Generate BigWig files for visualization ==========
+for sample in NB1 NB2 NB3 BR30-1 BR30-2 BR30-3; do
+  echo "=== Generating BigWig for $sample at $(date) ==="
+  
+  bamCoverage \
+    -b 03_align/bam/${sample}.final.bam \
+    -o 04_peaks/bigwig/${sample}.bw \
+    --binSize 10 \
+    --normalizeUsing RPKM \
+    --effectiveGenomeSize 1050000000 \
+    --numberOfProcessors 32 \
+    --extendReads \
+    2>&1 | tee logs/peaks/${sample}_bigwig.log
+  
+  echo "$sample BigWig done at $(date)"
+done
+
+# ========== Peak Statistics ==========
+echo ""
+echo "========== Peak Calling Summary =========="
+for sample in NB1 NB2 NB3 BR30-1 BR30-2 BR30-3; do
+  if [ -f "04_peaks/macs2/${sample}_peaks.broadPeak" ]; then
+    peak_count=$(wc -l < 04_peaks/macs2/${sample}_peaks.broadPeak)
+    echo "$sample: $peak_count broad peaks"
+  fi
+done
+
+echo ""
+echo "========== Output Files =========="
+ls -lh 04_peaks/macs2/*broadPeak
+ls -lh 04_peaks/bigwig/*.bw
+
+echo ""
+echo "✓ Step 4 completed at $(date)"
+
+
+cd /disk192/users_dir/buyu/1.布宇/supplement/28/analysis_cuttag
+
+# 检查broadPeak文件格式
+head -5 04_peaks/macs2/NB1_peaks.broadPeak
+echo ""
+
+# 检查文件是否存在
+ls -lh 04_peaks/macs2/*broadPeak
+
+# 检查有多少列
+awk '{print NF; exit}' 04_peaks/macs2/NB1_peaks.broadPeak
+
+# 查看前几行的具体内容
+head -3 04_peaks/macs2/NB1_peaks.broadPeak | column -t
+
+
+
+
+
+
+library(DESeq2)
+library(GenomicRanges)
+library(Rsubread)
+
+setwd("/disk192/users_dir/buyu/1.布宇/supplement/28/analysis_cuttag")
+
+cat("=== Loading peaks ===\n")
+samples <- c("NB1", "NB2", "NB3", "BR30-1", "BR30-2", "BR30-3")
+peak_files <- paste0("04_peaks/macs2/", samples, "_peaks.broadPeak")
+
+peak_list <- list()
+for(i in 1:length(samples)) {
+  df <- read.table(peak_files[i], sep="\t")
+  peak_list[[i]] <- GRanges(seqnames=df[,1], ranges=IRanges(start=df[,2], end=df[,3]))
+  cat(sprintf("%s: %d peaks\n", samples[i], length(peak_list[[i]])))
+}
+
+cat("\n=== Merging peaks ===\n")
+all_peaks <- do.call(c, peak_list)
+consensus_peaks <- reduce(all_peaks)
+cat(sprintf("Consensus: %d peaks\n", length(consensus_peaks)))
+
+cat("\n=== Counting reads ===\n")
+bam_files <- paste0("03_align/bam/", samples, ".final.bam")
+
+saf <- data.frame(
+  GeneID = paste0("peak_", 1:length(consensus_peaks)),
+  Chr = as.character(seqnames(consensus_peaks)),
+  Start = start(consensus_peaks),
+  End = end(consensus_peaks),
+  Strand = "."
+)
+
+fc <- featureCounts(files=bam_files, annot.ext=saf, isPairedEnd=TRUE, nthreads=32, requireBothEndsMapped=TRUE, countMultiMappingReads=FALSE)
+
+count_matrix <- fc$counts
+colnames(count_matrix) <- samples
+
+cat("\n=== Running DESeq2 ===\n")
+colData <- data.frame(condition=factor(c(rep("NB",3), rep("BR30",3)), levels=c("NB","BR30")), row.names=samples)
+
+dds <- DESeqDataSetFromMatrix(countData=count_matrix, colData=colData, design=~condition)
+dds <- dds[rowSums(counts(dds)) >= 10, ]
+cat(sprintf("Filtered: %d peaks\n", nrow(dds)))
+
+dds <- DESeq(dds)
+res <- results(dds, contrast=c("condition", "BR30", "NB"))
+
+res_df <- as.data.frame(res)
+res_df$peak_id <- rownames(res_df)
+coords <- saf[match(res_df$peak_id, saf$GeneID), ]
+res_df <- cbind(coords[,c("Chr","Start","End")], res_df)
+
+write.table(res_df, "05_diff_analysis/all_peaks_deseq2_results.txt", sep="\t", quote=F, row.names=F)
+
+cat("\n=== Applying thresholds ===\n")
+
+standard <- res_df[!is.na(res_df$padj) & res_df$padj<0.05 & abs(res_df$log2FoldChange)>1.0 & res_df$baseMean>50,]
+standard_up <- standard[standard$log2FoldChange>0,]
+standard_down <- standard[standard$log2FoldChange<0,]
+
+loose <- res_df[!is.na(res_df$padj) & res_df$padj<0.1 & abs(res_df$log2FoldChange)>0.585 & res_df$baseMean>30,]
+loose_up <- loose[loose$log2FoldChange>0,]
+loose_down <- loose[loose$log2FoldChange<0,]
+
+strict <- res_df[!is.na(res_df$padj) & res_df$padj<0.01 & abs(res_df$log2FoldChange)>1.5 & res_df$baseMean>100,]
+strict_up <- strict[strict$log2FoldChange>0,]
+strict_down <- strict[strict$log2FoldChange<0,]
+
+write.table(standard, "05_diff_analysis/standard/diff_peaks_all.txt", sep="\t", quote=F, row.names=F)
+write.table(standard_up, "05_diff_analysis/standard/diff_peaks_UP.txt", sep="\t", quote=F, row.names=F)
+write.table(standard_down, "05_diff_analysis/standard/diff_peaks_DOWN.txt", sep="\t", quote=F, row.names=F)
+
+write.table(loose, "05_diff_analysis/loose/diff_peaks_all.txt", sep="\t", quote=F, row.names=F)
+write.table(loose_up, "05_diff_analysis/loose/diff_peaks_UP.txt", sep="\t", quote=F, row.names=F)
+write.table(loose_down, "05_diff_analysis/loose/diff_peaks_DOWN.txt", sep="\t", quote=F, row.names=F)
+
+write.table(strict, "05_diff_analysis/strict/diff_peaks_all.txt", sep="\t", quote=F, row.names=F)
+write.table(strict_up, "05_diff_analysis/strict/diff_peaks_UP.txt", sep="\t", quote=F, row.names=F)
+write.table(strict_down, "05_diff_analysis/strict/diff_peaks_DOWN.txt", sep="\t", quote=F, row.names=F)
+
+cat("\n========================================\n")
+cat("Standard (FDR<0.05, |log2FC|>1.0, baseMean>50):\n")
+cat(sprintf("  Total: %d | UP: %d | DOWN: %d\n\n", nrow(standard), nrow(standard_up), nrow(standard_down)))
+
+cat("Loose (FDR<0.1, |log2FC|>0.585, baseMean>30):\n")
+cat(sprintf("  Total: %d | UP: %d | DOWN: %d\n\n", nrow(loose), nrow(loose_up), nrow(loose_down)))
+
+cat("Strict (FDR<0.01, |log2FC|>1.5, baseMean>100):\n")
+cat(sprintf("  Total: %d | UP: %d | DOWN: %d\n\n", nrow(strict), nrow(strict_up), nrow(strict_down)))
+
+cat("=== DONE ===\n")
